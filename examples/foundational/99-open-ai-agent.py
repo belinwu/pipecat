@@ -5,25 +5,111 @@
 #
 
 import os
+from abc import ABC, abstractmethod
+from dataclasses import field
+from typing import Literal, Optional
 
+import httpx
 from agents import Agent
 from dotenv import load_dotenv
 from loguru import logger
+from openai import BaseModel
 
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import (
+    Frame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMMessagesFrame,
+    LLMTextFrame,
+    LLMUpdateSettingsFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.aggregators.openai_llm_context import (
+    OpenAILLMContext,
+    OpenAILLMContextFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.services.ai_service import AIService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.openai.base_llm import BaseOpenAILLMService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
 from pipecat.transports.network.webrtc_connection import SmallWebRTCConnection
 
 load_dotenv(override=True)
+
+
+class LlmMessage(BaseModel):
+    #     ...
+    role: Literal["system", "user", "assistant", "tool"]
+    content: Optional[str]
+
+
+class AgentResponse(BaseModel):
+    content: str
+    msgs: list[LlmMessage] = field(default_factory=list)
+
+
+class BackendBase(ABC):
+    @abstractmethod
+    async def get_resp(self, messages: list[LlmMessage], extra_params) -> AgentResponse:
+        raise NotImplementedError("The method get_resp is not implemented.")
+
+
+class CompassLLMService(AIService):
+    def __init__(self, backend: BackendBase):
+        super().__init__()
+        self.backend = backend
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        context = None
+        if isinstance(frame, OpenAILLMContextFrame):
+            context: OpenAILLMContext = frame.context
+        elif isinstance(frame, LLMMessagesFrame):
+            context = OpenAILLMContext.from_messages(frame.messages)
+        elif isinstance(frame, LLMUpdateSettingsFrame):
+            await self._update_settings(frame.settings)
+        else:
+            await self.push_frame(frame, direction)
+
+        if context:
+            try:
+                await self.push_frame(LLMFullResponseStartFrame())
+                await self.start_processing_metrics()
+                # await self._process_context(context)
+
+                msgs = []
+                for contmsg in context.messages:
+                    msgs.append(
+                        LlmMessage(
+                            role=contmsg["role"],
+                            content=contmsg["content"],
+                        )
+                    )
+                resp = await self.backend.get_resp(
+                    msgs,
+                    {
+                        "conversation_id": "fake_conversation_id",
+                        "user_id": "fake_user_id",
+                    },
+                )
+
+                context.add_messages(resp.msgs)
+                await self.push_frame(LLMTextFrame(resp.content))
+
+            except httpx.TimeoutException:
+                await self._call_event_handler("on_completion_timeout")
+            finally:
+                await self.stop_processing_metrics()
+                await self.push_frame(LLMFullResponseEndFrame())
 
 
 async def run_bot(webrtc_connection: SmallWebRTCConnection):
@@ -55,22 +141,8 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection):
             "content": "You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Your output will be converted to audio so don't include special characters in your answers. Respond to what the user said in a creative and helpful way.",
         },
     ]
-    agent = Agent(
-        name="Math Tutor",
-        instructions="You provide help with math problems. Explain your reasoning at each step and include examples",
-        # output_type="probably something here?",
-        # handoffs=[]
-    )
-    # You can also do this to pass a context...
-    # agent = Agent[OpenAILLMContext]
-    # Not sure how useful this is, but it seems like a good idea to have
-    math_tool = agent.as_tool(
-        tool_name="math_tool",
-        tool_description="Call this tool whenever someone asks for help with math problems. You will be able to ask follow up questions to clarify the problem.",
-    )
-    tools = ToolsSchema(standard_tools=[math_tool])
 
-    context = OpenAILLMContext(messages=messages, tools=tools)
+    context = OpenAILLMContext(messages=messages)
     context_aggregator = llm.create_context_aggregator(context)
 
     pipeline = Pipeline(
