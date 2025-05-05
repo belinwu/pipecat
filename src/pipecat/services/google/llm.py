@@ -47,6 +47,7 @@ from pipecat.services.openai.llm import (
     OpenAIAssistantContextAggregator,
     OpenAIUserContextAggregator,
 )
+from pipecat.utils.tracing.tracing import AttachmentStrategy, is_tracing_available, traced
 
 # Suppress gRPC fork warnings
 os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
@@ -493,21 +494,28 @@ class GoogleLLMService(LLMService):
             self._model_name, system_instruction=self._system_instruction
         )
 
+    @traced(attachment_strategy=AttachmentStrategy.CHILD, name="google_process_context")
     async def _process_context(self, context: OpenAILLMContext):
-        await self.push_frame(LLMFullResponseStartFrame())
-
+        # Usage tracking variables
         prompt_tokens = 0
         completion_tokens = 0
         total_tokens = 0
 
+        # API request info for tracing
+        generation_params = {}
+        has_tools = False
+        tool_count = 0
+        serialized_messages = None
+
+        # Response metadata for tracing
         grounding_metadata = None
         search_result = ""
 
         try:
-            logger.debug(
-                # f"{self}: Generating chat [{self._system_instruction}] | [{context.get_messages_for_logging()}]"
-                f"{self}: Generating chat [{context.get_messages_for_logging()}]"
-            )
+            await self.push_frame(LLMFullResponseStartFrame())
+            await self.start_processing_metrics()
+
+            logger.debug(f"{self}: Generating chat [{context.get_messages_for_logging()}]")
 
             messages = context.messages
             if context.system_message and self._system_instruction != context.system_message:
@@ -529,15 +537,30 @@ class GoogleLLMService(LLMService):
 
             generation_config = GenerationConfig(**generation_params) if generation_params else None
 
-            await self.start_ttfb_metrics()
+            # Collect information for tracing
             tools = []
             if context.tools:
                 tools = context.tools
+                has_tools = True
+                tool_count = len(tools)
             elif self._tools:
                 tools = self._tools
+                has_tools = True
+                tool_count = len(tools)
+
+            # Prepare messages for tracing
+            if is_tracing_available():
+                try:
+                    serialized_messages = json.dumps(context.get_messages_for_logging())
+                except Exception as e:
+                    serialized_messages = f"Error serializing messages: {str(e)}"
+
             tool_config = None
             if self._tool_config:
                 tool_config = self._tool_config
+
+            await self.start_ttfb_metrics()
+
             response = await self._client.generate_content_async(
                 contents=messages,
                 tools=tools,
@@ -545,6 +568,7 @@ class GoogleLLMService(LLMService):
                 generation_config=generation_config,
                 tool_config=tool_config,
             )
+
             await self.stop_ttfb_metrics()
 
             if response.usage_metadata:
@@ -577,7 +601,6 @@ class GoogleLLMService(LLMService):
                     # If the response doesn't include groundingMetadata, this means the response wasn't grounded.
                     if chunk.candidates:
                         for candidate in chunk.candidates:
-                            # logger.debug(f"candidate received: {candidate}")
                             # Extract grounding metadata
                             grounding_metadata = (
                                 {
@@ -651,6 +674,9 @@ class GoogleLLMService(LLMService):
                 )
                 await self.push_frame(llm_search_frame)
 
+            await self.stop_processing_metrics()
+
+            # Report metrics through internal metrics system
             await self.start_llm_usage_metrics(
                 LLMTokenUsage(
                     prompt_tokens=prompt_tokens,
@@ -658,7 +684,61 @@ class GoogleLLMService(LLMService):
                     total_tokens=total_tokens,
                 )
             )
+
             await self.push_frame(LLMFullResponseEndFrame())
+
+            # Add tracing information
+            if is_tracing_available():
+                from opentelemetry import trace
+
+                from pipecat.utils.tracing.helpers import add_llm_span_attributes
+
+                current_span = trace.get_current_span()
+                service_name = self.__class__.__name__.replace("LLMService", "").lower()
+
+                # Prepare extra parameters from settings
+                extra_parameters = {}
+                if self._settings["extra"]:
+                    for key, value in self._settings["extra"].items():
+                        if isinstance(value, (int, float, bool, str)):
+                            extra_parameters[key] = value
+
+                # Prepare Google-specific attributes
+                google_specific = {
+                    "system_instruction": self._system_instruction,
+                    "has_grounding": grounding_metadata is not None,
+                }
+
+                if grounding_metadata:
+                    # Add simplified grounding metadata (just the count of sources)
+                    try:
+                        source_count = len(grounding_metadata.get("origins", []))
+                        google_specific["source_count"] = source_count
+                    except Exception:
+                        pass
+
+                # Combine parameters for trace attributes
+                combined_params = {**generation_params, **google_specific}
+
+                # Add token usage information
+                token_usage = {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                }
+
+                add_llm_span_attributes(
+                    span=current_span,
+                    service_name=service_name,
+                    model=self.model_name,
+                    stream=True,
+                    messages=serialized_messages,
+                    tools=json.dumps(tools) if has_tools else None,
+                    tool_count=tool_count,
+                    token_usage=token_usage,
+                    parameters=combined_params,
+                    extra_parameters=extra_parameters,
+                    ttfb_ms=self._metrics.ttfb_ms if hasattr(self._metrics, "ttfb_ms") else None,
+                )
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
