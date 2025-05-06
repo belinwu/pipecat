@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added new AWS services `AWSBedrockLLMService` and `AWSTranscribeSTTService`.
+
 - Added `enable_ssml_parsing` and `enable_logging` to `InputParams` in
   `ElevenLabsTTSService`.
 
@@ -22,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated the default voice for `DeepgramTTSService` to `aura-2-helena-en`.
 
 ### Deprecated
+
+- `PollyTTSService` is now deprecated, use `AWSPollyTTSService` instead.
 
 - Observer `on_push_frame(src, dst, frame, direction, timestamp)` is now
   deprecated, use `on_push_frame(data: FramePushed)` instead.
