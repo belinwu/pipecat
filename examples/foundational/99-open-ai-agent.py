@@ -10,7 +10,6 @@ from dataclasses import field
 from typing import Literal, Optional
 
 import httpx
-from agents import Agent
 from dotenv import load_dotenv
 from loguru import logger
 from openai import BaseModel
@@ -28,6 +27,10 @@ from pipecat.frames.frames import (
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.aggregators.llm_response import (
+    LLMAssistantAggregatorParams,
+    LLMUserAggregatorParams,
+)
 from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContext,
     OpenAILLMContextFrame,
@@ -37,7 +40,12 @@ from pipecat.services.ai_service import AIService
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.base_llm import BaseOpenAILLMService
-from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.llm import (
+    OpenAIAssistantContextAggregator,
+    OpenAIContextAggregatorPair,
+    OpenAILLMService,
+    OpenAIUserContextAggregator,
+)
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
 from pipecat.transports.network.webrtc_connection import SmallWebRTCConnection
@@ -66,6 +74,33 @@ class CompassLLMService(AIService):
     def __init__(self, backend: BackendBase):
         super().__init__()
         self.backend = backend
+
+    def create_context_aggregator(
+        self,
+        context: OpenAILLMContext,
+        *,
+        user_params: LLMUserAggregatorParams = LLMUserAggregatorParams(),
+        assistant_params: LLMAssistantAggregatorParams = LLMAssistantAggregatorParams(),
+    ) -> OpenAIContextAggregatorPair:
+        """Create an instance of OpenAIContextAggregatorPair from an
+        OpenAILLMContext. Constructor keyword arguments for both the user and
+        assistant aggregators can be provided.
+
+        Args:
+            context (OpenAILLMContext): The LLM context.
+            user_params (LLMUserAggregatorParams, optional): User aggregator parameters.
+            assistant_params (LLMAssistantAggregatorParams, optional): User aggregator parameters.
+
+        Returns:
+            OpenAIContextAggregatorPair: A pair of context aggregators, one for
+            the user and one for the assistant, encapsulated in an
+            OpenAIContextAggregatorPair.
+
+        """
+        context.set_llm_adapter(self.get_llm_adapter())
+        user = OpenAIUserContextAggregator(context, params=user_params)
+        assistant = OpenAIAssistantContextAggregator(context, params=assistant_params)
+        return OpenAIContextAggregatorPair(_user=user, _assistant=assistant)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
